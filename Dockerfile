@@ -8,4 +8,4 @@ RUN unzip RTCF_ST_AMD-0.3.zip
 RUN chmod +x ./RTCF
 
 ENV TZ=Asia/Tehran
-CMD [ "/root/RTCF", "-config", "/etc/xray/config.json" ]
+CMD [ "/root/RTCF", "--auto:on --iran", "--lport:443 --password:123" ]
