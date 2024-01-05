@@ -22,7 +22,7 @@ type
         store: Store
 
 const
-    bufferSize = 4096
+    bufferSize = 4093
 
 
 proc getRawSocket*(self: ConnectionAdapter): StreamTransport {.inline.} = self.socket
@@ -36,7 +36,7 @@ proc readloop(self: ConnectionAdapter){.async.} =
         try:
             sv = await procCall read(Tunnel(self), 1)
             trace "Readloop Read", bytes = sv.len
-        except [CancelledError, FlowError]:
+        except [CancelledError, FlowError,AsyncChannelError]:
             var e = getCurrentException()
             warn "Readloop Cancel [Read]", msg = e.name
             if not self.stopped: signal(self, both, close)
@@ -48,10 +48,10 @@ proc readloop(self: ConnectionAdapter){.async.} =
 
         try:
             trace "Readloop write to socket", count = sv.len
-            if sv.len != await socket.write(sv.buf, sv.len):
+            if sv.len != await socket.write(sv.buf, sv.len).wait(5000):
                 raise newAsyncStreamIncompleteError()
 
-        except [CancelledError, FlowError, TransportError, AsyncStreamError]:
+        except [CancelledError, FlowError,AsyncTimeoutError,TransportError,AsyncChannelError, AsyncStreamError]:
             var e = getCurrentException()
             warn "Readloop Cancel [Write]", msg = e.name
             if not self.stopped: signal(self, both, close)

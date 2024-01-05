@@ -45,7 +45,7 @@ const
     SizeHeaderLen = 2
     MuxHeaderLen = CidHeaderLen + SizeHeaderLen
     ConnectionChanFixedSizeW = 1
-    ConnectionChanFixedSizeR = -1
+    ConnectionChanFixedSizeR = 8192
 
 
 var globalTable: ptr UncheckedArray[DualChan]
@@ -79,6 +79,8 @@ template close(c: DualChanPtr) = c[].close()
 proc globalTableHas(id: Cid): bool =
     safeAccess:
         return not (isNil(globalTable[id].first) or isNil(globalTable[id].second))
+
+
 
 proc closePacket(self: MuxAdapetr, cid: Cid): StringView =
     var sv = self.store.pop()
@@ -124,7 +126,7 @@ proc stop*(self: MuxAdapetr, sendclose: bool = true) =
 proc handleCid(self: MuxAdapetr, cid: Cid, firstdata_const: StringView = nil) {.async.} =
     var first_data = firstdata_const
 
-    while not self.stopped:
+    while true:
         var sv: StringView = nil
         try:
             if first_data.isNil:
@@ -138,9 +140,12 @@ proc handleCid(self: MuxAdapetr, cid: Cid, firstdata_const: StringView = nil) {.
 
         except CancelledError as e:
             trace "HandleCid Canceled [Read]", msg = e.name, cid = cid
-            # quit(1)
+            if self.location == AfterGfw:
+                discard globalTable[cid].second.send(closePacket(self, cid))
+
             notice "saving ", cid = cid
-            asyncSpawn muxSaveQueue.send (cid, nil)
+            muxSaveQueue.sendSync (cid, sv)
+
             return
         except CatchableError as e:
             error "HandleCid Unexpeceted Error, [Read]", name = e.name, msg = e.msg
@@ -165,10 +170,13 @@ proc handleCid(self: MuxAdapetr, cid: Cid, firstdata_const: StringView = nil) {.
         except [CancelledError, AsyncStreamError, TransportError, FlowError, WebSocketError]:
             var e = getCurrentException()
             error "HandleCid Canceled [Write] ", msg = e.name, cid = cid
+
             # no need to reuse non-nil sv because write have to
-            if not sv.isNil:
-                notice "saving ", cid = cid
-                asyncSpawn muxSaveQueue.send (cid, sv)
+            if self.location == AfterGfw:
+                discard globalTable[cid].second.send(closePacket(self, cid))
+            notice "saving ", cid = cid
+            muxSaveQueue.sendSync (cid, sv)
+
             if not self.stopped: signal(self, both, close)
             return
         except CatchableError as e:
@@ -177,11 +185,7 @@ proc handleCid(self: MuxAdapetr, cid: Cid, firstdata_const: StringView = nil) {.
 
 
 
-proc acceptcidloop(self: MuxAdapetr) {.async: (raw: true, raises: [CancelledError]).} =
-    var retFut = newFuture[void]()
-
-    proc register(cid: Cid, firstdata: StringView = nil) =
-        assert(globalTableHas cid)
+proc register(self: MuxAdapetr,cid: Cid, firstdata: StringView = nil) =
         var fut = self.handleCid(cid, firstdata)
         self.handles.add fut
         fut.callback = proc(udata: pointer) =
@@ -189,44 +193,37 @@ proc acceptcidloop(self: MuxAdapetr) {.async: (raw: true, raises: [CancelledErro
             if index != -1: self.handles.del index
         asyncSpawn fut
 
-    proc restoration(){.async.} =
-        while not self.stopped:
-            var (cid, data) = await muxSaveQueue.recv()
-            trace "acceptcidloop restored a cid", cid = cid
-            register(cid, data)
+proc restore(self: MuxAdapetr) =
+    while muxSaveQueue.dataLeft() > 0:
+        try:
+            var (cid, data) =  muxSaveQueue.recvSync()
+            notice "Restored", cid = cid
+            self.register(cid, data)
+        except:
+            var e = getCurrentException()
+            error "Restore error !", msg = e.name, msg = e.msg
 
-    proc newRegisters(){.async.} =
-        while not self.stopped:
-            try:
-                let new_cid = await self.masterChannel.recv()
-                trace "acceptcidloop got a cid", cid = new_cid
-                register(new_cid, nil)
-            except AsyncChannelError: # only means cancel !
-                error "acceptcidloop [newRegisters] got AsyncChannelError!"
-                if not self.stopped: signal(self, both, close)
+proc acceptcidloop(self: MuxAdapetr) {.async.} =
+    while not self.stopped:
+        try:
+            let new_cid = await self.masterChannel.recv()
+            trace "acceptcidloop got a cid", cid = new_cid
+            self.register(new_cid, nil)
+        except AsyncChannelError: # only means cancel !
+            error "acceptcidloop [newRegisters] got AsyncChannelError!"
+            if not self.stopped: signal(self, both, close)
 
-    var restore_fut = restoration()
-    var newregs_fut = newRegisters()
-
-    retFut.callback = proc(udata: pointer) =
-        trace "acceptcidloop finish"
-        retFut.complete()
-    retFut.cancelCallback = proc(udata: pointer) =
-        trace "acceptcidloop canceled"
-        restore_fut.cancelSoon()
-        newregs_fut.cancelSoon()
-    return retFut
 
 proc readloop(self: MuxAdapetr, whenNotFound: CidNotExistBehaviour){.async.} =
     #read data from right adapetr, send it to the right chan
     var data: StringView = nil
-    assert not self.stopped
+    # assert not self.stopped
     try:
         while not self.stopped:
             #reads exactly MuxHeaderLen size
             var sv = await procCall read(Tunnel(self), MuxHeaderLen)
             var size: uint16 = 0
-            var cid: uint16 = 0
+            var cid: Cid = 0
             copyMem(addr cid, sv.buf, sizeof(cid)); sv.shiftr sizeof(cid)
             copyMem(addr size, sv.buf, sizeof(size)); sv.shiftr sizeof(size)
 
@@ -242,60 +239,55 @@ proc readloop(self: MuxAdapetr, whenNotFound: CidNotExistBehaviour){.async.} =
                     sv.shiftl MuxHeaderLen; sv
 
 
-            if globalTableHas(cid):
-                try:
-                    assert data != nil
-                    if(size == 0):
-                        await globalTable[cid].second.send(data)
-                    else:
-                        await globalTable[cid].second.send data
-                    data = nil
-                except AsyncChannelError as e:
-                    # channel is half closed ...
-                    self.store.reuse move data
-                    warn "read loop was about to write data to a half closed chanenl!", msg = e.msg, cid = cid
-                    await sleepAsync(0.milliseconds)
-                    continue
 
-            else:
-                if size == 0: self.store.reuse move data; continue # dont do anything
 
-                case whenNotFound:
-
-                    of create:
-                        # echo "make:      ",cid
-                        trace "creating left channels", cid = cid
-                        safeAccess:
-                            globalTable[cid].first = newAsyncChannel[StringView](maxItems = ConnectionChanFixedSizeW)
-                            globalTable[cid].second = newAsyncChannel[StringView](maxItems = ConnectionChanFixedSizeR)
-                            globalTable[cid].first.open()
-                            globalTable[cid].second.open()
-
-                        trace "data is written to created channel", cid = cid
-
-                        var fut = self.handleCid(cid)
-                        self.handles.add fut
-                        fut.callback = proc(udata: pointer) =
-                            let index = self.handles.find fut
-                            if index != -1: self.handles.del index
-                        asyncSpawn fut
-
-                        await globalTable[cid].second.send move data
-                        self.masterChannel.sendSync cid
-
-                    of sendclose:
-                        if size > 0:
+            safeAccess:
+                if not (isNil(globalTable[cid].first) or isNil(globalTable[cid].second)):
+                    try:
+                        if not (globalTable[cid].second.trySend(data)):
                             self.store.reuse move data
-                            # trace "sending close for", cid = cid
-                            # # echo "close-back:  ",cid
-                            # await procCall write(Tunnel(self), closePacket(self, cid))
-                        else:
-                            self.store.reuse move data
-                    of nothing:
+                            discard globalTable[cid].first.send(closePacket(self, cid))
+                        data = nil; continue
+                    except AsyncChannelError as e:
+                        # channel is half closed ...
                         self.store.reuse move data
+                        warn "read loop was about to write data to a half closed chanenl!", msg = e.msg, cid = cid
+                        continue
 
 
-    except [CancelledError, AsyncChannelError, FlowError, TransportError]:
+            if size == 0: self.store.reuse move data; continue # dont do anything
+
+            case whenNotFound:
+                of create:
+                    # echo "make:      ",cid
+                    trace "creating left channels", cid = cid
+                    safeAccess:
+                        globalTable[cid].first = newAsyncChannel[StringView](maxItems = ConnectionChanFixedSizeW)
+                        globalTable[cid].second = newAsyncChannel[StringView](maxItems = ConnectionChanFixedSizeR)
+                        globalTable[cid].first.open()
+                        globalTable[cid].second.open()
+                    trace "data is written to created channel", cid = cid
+                    var fut = self.handleCid(cid)
+                    self.handles.add fut
+                    fut.callback = proc(udata: pointer) =
+                        let index = self.handles.find fut
+                        if index != -1: self.handles.del index
+                    asyncSpawn fut
+                    await globalTable[cid].second.send move data
+                    self.masterChannel.sendSync cid
+                of sendclose:
+                    if size > 0:
+                        self.store.reuse move data
+                        # trace "sending close for", cid = cid
+                        # # echo "close-back:  ",cid
+                        # await procCall write(Tunnel(self), closePacket(self, cid))
+                    else:
+                        self.store.reuse move data
+                of nothing:
+                    self.store.reuse move data
+
+
+    except [CancelledError, AsyncChannelError, WSClosedError, FlowError, TransportError]:
         var e = getCurrentException()
         trace "Readloop canceled", name = e.name, msg = e.msg
     except AsyncStreamError as e:
@@ -353,6 +345,7 @@ method start(self: MuxAdapetr){.raises: [].} =
                         self.masterChannel.sendSync cid
 
                     of Side.Right:
+                        self.restore()
                         # right side, we accept cid signals
                         self.acceptConnectionFut = acceptcidloop(self)
                         # we also need to read from right adapter
@@ -371,7 +364,7 @@ method start(self: MuxAdapetr){.raises: [].} =
 
                     of Side.Right:
                         # right side, we create cid signals
-                        # self.acceptConnectionFut = acceptcidloop(self)
+                        self.restore()
                         # we also need to read from right adapter
                         # examine and forward data to left channel
                         self.readloopFut = readloop(self, create)
@@ -447,6 +440,10 @@ method read*(self: MuxAdapetr, bytes: int, chain: Chains = default): Future[Stri
         assert sv != nil
         copyMem(addr cid, sv.buf, sizeof(cid)); sv.shiftr sizeof(cid)
         copyMem(addr size, sv.buf, sizeof(size)); sv.shiftr sizeof(size)
+
+        if self.stopped:
+            self.store.reuse sv
+            raise newException(AsyncChannelError, message = "closed pipe")
 
         if self.selectedCon.cid != cid:
             fatal "cid mismatch!", c1 = self.selectedCon.cid, c2 = cid; quit(1)
